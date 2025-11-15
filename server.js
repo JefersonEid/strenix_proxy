@@ -2,19 +2,61 @@ import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 import ffmpeg from "fluent-ffmpeg";
+import request from "request";
 import { PassThrough } from "stream";
 
 const app = express();
 app.use(cors());
 
-const FF = "/usr/bin/ffmpeg"; // Render usa esse path normalmente
+const FF = "/usr/bin/ffmpeg"; // Caminho padrão no Render
+
+// ============================================
+//         ROTA PROXY ORIGINAL (/proxy)
+// ============================================
+
+app.get("/proxy", (req, res) => {
+    const fileId = req.query.fileId;
+    if (!fileId) {
+        return res.status(400).send("Missing fileId");
+    }
+
+    const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
+    const range = req.headers.range || null;
+
+    const headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+        "Connection": "keep-alive"
+    };
+
+    if (range) {
+        headers["Range"] = range;
+    }
+
+    request({
+        url,
+        headers,
+        followAllRedirects: true
+    })
+        .on("response", (driveRes) => {
+            res.status(driveRes.statusCode);
+            Object.entries(driveRes.headers).forEach(([key, value]) => {
+                res.setHeader(key, value);
+            });
+        })
+        .on("error", () => res.sendStatus(500))
+        .pipe(res);
+});
+
+// ============================================
+//        ROTA HLS (CONVERSOR REAL)
+// ============================================
 
 app.get("/hls", async (req, res) => {
     const fileId = req.query.fileId;
     if (!fileId) return res.status(400).send("Missing fileId");
 
     const googleUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
-
     const videoStream = new PassThrough();
 
     try {
@@ -30,7 +72,6 @@ app.get("/hls", async (req, res) => {
             return res.status(500).send("Erro ao acessar Google Drive.");
         }
 
-        // Pipe Google → videoStream
         response.body.pipe(videoStream);
     } catch (err) {
         console.error("Erro gravíssimo:", err);
@@ -39,7 +80,6 @@ app.get("/hls", async (req, res) => {
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
 
-    // ffmpeg → converte MKV/MP4/AVI → HLS verdadeiro
     ffmpeg(videoStream)
         .setFfmpegPath(FF)
         .addOptions([
@@ -53,9 +93,7 @@ app.get("/hls", async (req, res) => {
             "-hls_flags delete_segments+append_list",
         ])
         .format("hls")
-        .on("start", (cmd) => {
-            console.log("FFMPEG CMD:", cmd);
-        })
+        .on("start", (cmd) => console.log("FFMPEG:", cmd))
         .on("error", (err) => {
             console.error("Erro no ffmpeg:", err);
             res.end();
@@ -63,7 +101,15 @@ app.get("/hls", async (req, res) => {
         .pipe(res);
 });
 
-app.listen(3000, () => {
-    console.log("🔥 Servidor HLS no Render ativo na porta 3000");
+// ============================================
+//         INICIAR SERVIDOR
+// ============================================
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log("🔥 Servidor Strenix ativo na porta " + PORT);
+    console.log("Rotas disponíveis:");
+    console.log("👉 /proxy?fileId=");
+    console.log("👉 /hls?fileId=");
 });
 
