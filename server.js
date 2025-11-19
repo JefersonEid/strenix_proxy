@@ -94,7 +94,6 @@ app.get("/hls", async (req, res) => {
 
     ffmpeg(videoStream)
         .inputOptions([
-            "-reorder_queue_size", "99999",
             "-analyzeduration", "2147483647",
             "-probesize", "2147483647",
             "-fflags", "+discardcorrupt",
