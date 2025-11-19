@@ -1,108 +1,57 @@
 import express from "express";
 import cors from "cors";
-import fetch from "node-fetch";
 import ffmpeg from "fluent-ffmpeg";
-import request from "request";
 import { PassThrough } from "stream";
+import { google } from "googleapis";
 
 const app = express();
 app.use(cors());
 
-// Caminho do ffmpeg dentro do Docker/Render
+// Caminho do FFmpeg no Docker Render
 const FF = "/usr/bin/ffmpeg";
 
-
 // ==========================================================
-// FUNÇÃO 100% COMPATÍVEL COM GOOGLE DRIVE (COM CONFIRM TOKEN)
-// ==========================================================
-
-async function downloadFromDrive(fileId) {
-    const base = `https://drive.google.com/uc?export=download&id=${fileId}`;
-
-    // PRIMEIRA REQUISIÇÃO — captura cookies e tela "scan virus"
-    const first = await fetch(base, {
-        headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "text/html,application/xhtml+xml,application/xml",
-        }
-    });
-
-    if (!first.ok) {
-        console.error("❌ Google Drive respondeu status:", first.status);
-        return null;
-    }
-
-    const firstText = await first.text();
-
-    // Detecta token confirm=XYZ
-    const confirmMatch = firstText.match(/confirm=([0-9A-Za-z_]+)/);
-
-    // Se existe token — gera URL liberada
-    if (confirmMatch) {
-        const confirm = confirmMatch[1];
-
-        const downloadUrl = 
-            `https://drive.google.com/uc?export=download&confirm=${confirm}&id=${fileId}`;
-
-        console.log("🔑 Token confirm detectado:", confirm);
-        console.log("📥 Baixando usando URL liberada...");
-
-        return await fetch(downloadUrl, {
-            headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                "Accept": "*/*"
-            }
-        });
-    }
-
-    // Se não há token, então o first já contém o stream
-    console.log("📥 Download direto sem confirm");
-    return await fetch(base, {
-        headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "*/*"
-        }
-    });
-}
-
-
-// ==========================================================
-//                ROTA /proxy (MKV direto)
+//   AUTENTICAÇÃO GOOGLE DRIVE API — SERVICE ACCOUNT (JWT)
 // ==========================================================
 
-app.get("/proxy", (req, res) => {
-    const fileId = req.query.fileId;
-    if (!fileId) return res.status(400).send("Missing fileId");
+const serviceAccountKey = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
 
-    const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
-    const range = req.headers.range || null;
-
-    const headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "*/*",
-        "Connection": "keep-alive"
-    };
-
-    if (range) headers["Range"] = range;
-
-    request({
-        url,
-        headers,
-        followAllRedirects: true
-    })
-    .on("response", (driveRes) => {
-        res.status(driveRes.statusCode);
-        Object.entries(driveRes.headers).forEach(([key, value]) => {
-            res.setHeader(key, value);
-        });
-    })
-    .on("error", () => res.sendStatus(500))
-    .pipe(res);
+const auth = new google.auth.GoogleAuth({
+    credentials: serviceAccountKey,
+    scopes: ["https://www.googleapis.com/auth/drive.readonly"],
 });
 
+const drive = google.drive({
+    version: "v3",
+    auth,
+});
 
 // ==========================================================
-//          ROTA /hls — HLS REAL CONVERTIDO PELO FFMPEG
+//   FUNÇÃO: STREAM DIRECTO DO GOOGLE DRIVE VIA API OFICIAL
+// ==========================================================
+
+async function getDriveStream(fileId) {
+    try {
+        const { data } = await drive.files.get(
+            {
+                fileId: fileId,
+                alt: "media",
+            },
+            {
+                responseType: "stream",
+            }
+        );
+
+        console.log("📥 Stream de vídeo obtido via Google Drive API");
+        return data;
+    } catch (err) {
+        console.error("❌ Erro ao obter stream do Drive:", err.response?.status);
+        return null;
+    }
+}
+
+// ==========================================================
+//   ROTA /hls — CONVERSÃO EM HLS EM TEMPO REAL COM FFMPEG
 // ==========================================================
 
 app.get("/hls", async (req, res) => {
@@ -110,32 +59,31 @@ app.get("/hls", async (req, res) => {
     if (!fileId) return res.status(400).send("Missing fileId");
 
     console.log("========================================================");
-    console.log("🎬 INICIANDO SESSÃO HLS");
+    console.log("🎬 INICIANDO SESSÃO HLS (Google Drive API)");
     console.log("📁 FileId:", fileId);
     console.log("========================================================");
 
+    // Stream entre Google Drive e ffmpeg
     const videoStream = new PassThrough();
 
     try {
-        console.log("🌐 Conectando ao Google Drive...");
-        const response = await downloadFromDrive(fileId);
+        const driveStream = await getDriveStream(fileId);
 
-        if (!response || !response.ok) {
-            console.error("❌ Erro ao acessar arquivo no Google Drive");
+        if (!driveStream) {
+            console.error("❌ Falha ao acessar Google Drive");
             return res.status(500).send("Erro ao acessar Google Drive.");
         }
 
-        console.log("📥 Google Drive liberou download.");
-        response.body.pipe(videoStream);
+        driveStream.pipe(videoStream);
 
     } catch (err) {
-        console.error("❌ Erro gravíssimo ao iniciar streaming:", err);
+        console.error("❌ Erro grave:", err);
         return res.status(500).send("Falha ao iniciar streaming.");
     }
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
 
-    console.log("🎞️ Iniciando ffmpeg HLS...");
+    console.log("🎞️ Iniciando ffmpeg HLS (Google Drive API)...");
 
     ffmpeg(videoStream)
         .setFfmpegPath(FF)
@@ -151,7 +99,7 @@ app.get("/hls", async (req, res) => {
         ])
         .format("hls")
         .on("start", (cmd) => {
-            console.log("🚀 FFMPEG iniciado:");
+            console.log("🚀 FFMPEG CMD:");
             console.log(cmd);
         })
         .on("error", (err) => {
@@ -161,6 +109,29 @@ app.get("/hls", async (req, res) => {
         .pipe(res);
 });
 
+// ==========================================================
+//    ROTA /proxy — STREAM DIRETO SEM HLS (OPCIONAL)
+// ==========================================================
+
+app.get("/proxy", async (req, res) => {
+    const fileId = req.query.fileId;
+    if (!fileId) return res.status(400).send("Missing fileId");
+
+    try {
+        const driveStream = await getDriveStream(fileId);
+
+        if (!driveStream) {
+            return res.status(500).send("Erro ao acessar Google Drive.");
+        }
+
+        res.setHeader("Content-Type", "video/mp4");
+        driveStream.pipe(res);
+
+    } catch (err) {
+        console.error("❌ Erro no /proxy:", err);
+        res.sendStatus(500);
+    }
+});
 
 // ==========================================================
 //                START DO SERVIDOR
@@ -170,7 +141,7 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
     console.log("");
-    console.log("🔥 SERVIDOR STRENIX INICIADO!");
+    console.log("🔥 SERVIDOR STRENIX GOOGLE-DRIVE-HLS INICIADO!");
     console.log("🌍 Porta:", PORT);
     console.log("🛠 Rotas disponíveis:");
     console.log("   👉 GET /proxy?fileId=");
