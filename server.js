@@ -14,7 +14,13 @@ const FF = "/usr/bin/ffmpeg";
 //   AUTENTICAÇÃO GOOGLE DRIVE API — SERVICE ACCOUNT (JWT)
 // ==========================================================
 
-const serviceAccountKey = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+let serviceAccountKey = null;
+
+try {
+    serviceAccountKey = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+} catch (err) {
+    console.error("❌ ERRO AO LER GOOGLE_SERVICE_ACCOUNT_KEY:", err);
+}
 
 const auth = new google.auth.GoogleAuth({
     credentials: serviceAccountKey,
@@ -27,7 +33,7 @@ const drive = google.drive({
 });
 
 // ==========================================================
-//   FUNÇÃO: STREAM DIRECTO DO GOOGLE DRIVE VIA API OFICIAL
+//   FUNÇÃO: STREAM DIRETO DO GOOGLE DRIVE VIA API OFICIAL
 // ==========================================================
 
 async function getDriveStream(fileId) {
@@ -63,7 +69,7 @@ app.get("/hls", async (req, res) => {
     console.log("📁 FileId:", fileId);
     console.log("========================================================");
 
-    // Stream entre Google Drive e ffmpeg
+    // Stream intermediário entre Google Drive e ffmpeg
     const videoStream = new PassThrough();
 
     try {
@@ -74,6 +80,7 @@ app.get("/hls", async (req, res) => {
             return res.status(500).send("Erro ao acessar Google Drive.");
         }
 
+        // Pipe direto do Drive para FFmpeg
         driveStream.pipe(videoStream);
 
     } catch (err) {
@@ -86,6 +93,13 @@ app.get("/hls", async (req, res) => {
     console.log("🎞️ Iniciando ffmpeg HLS (Google Drive API)...");
 
     ffmpeg(videoStream)
+        .inputOptions([
+            "-reorder_queue_size", "99999",
+            "-analyzeduration", "2147483647",
+            "-probesize", "2147483647",
+            "-fflags", "+discardcorrupt",
+            "-safe", "0"
+        ])
         .setFfmpegPath(FF)
         .addOptions([
             "-preset ultrafast",
@@ -96,6 +110,7 @@ app.get("/hls", async (req, res) => {
             "-hls_time 4",
             "-hls_list_size 0",
             "-hls_flags delete_segments+append_list",
+            "-max_muxing_queue_size", "99999"
         ])
         .format("hls")
         .on("start", (cmd) => {
@@ -104,7 +119,9 @@ app.get("/hls", async (req, res) => {
         })
         .on("error", (err) => {
             console.error("❌ Erro no ffmpeg:", err);
-            res.end();
+            try {
+                res.end();
+            } catch (e) {}
         })
         .pipe(res);
 });
