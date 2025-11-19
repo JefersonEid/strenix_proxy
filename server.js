@@ -9,10 +9,7 @@ app.use(cors());
 
 const FF = "/usr/bin/ffmpeg";
 
-// ==========================================================
-// GOOGLE DRIVE API — SERVICE ACCOUNT
-// ==========================================================
-
+// GOOGLE DRIVE API
 let serviceAccountKey = null;
 
 try {
@@ -26,40 +23,23 @@ const auth = new google.auth.GoogleAuth({
     scopes: ["https://www.googleapis.com/auth/drive.readonly"],
 });
 
-const drive = google.drive({
-    version: "v3",
-    auth,
-});
-
-// ==========================================================
-// FUNÇÃO: STREAM OFICIAL DO GOOGLE DRIVE
-// ==========================================================
+const drive = google.drive({ version: "v3", auth });
 
 async function getDriveStream(fileId) {
     try {
         const { data } = await drive.files.get(
-            {
-                fileId: fileId,
-                alt: "media",
-            },
-            {
-                responseType: "stream",
-            }
+            { fileId, alt: "media" },
+            { responseType: "stream" }
         );
-
         console.log("📥 Stream de vídeo obtido via Google Drive API");
         return data;
-
     } catch (err) {
         console.error("❌ Erro ao obter stream do Drive:", err.response?.status);
         return null;
     }
 }
 
-// ==========================================================
-// ROTA HLS — FFMPEG EM TEMPO REAL
-// ==========================================================
-
+// HLS REAL — LOW LATENCY MODE
 app.get("/hls", async (req, res) => {
 
     const fileId = req.query.fileId;
@@ -71,29 +51,28 @@ app.get("/hls", async (req, res) => {
     console.log("========================================================");
 
     const driveStream = await getDriveStream(fileId);
+    if (!driveStream) return res.status(500).send("Erro ao acessar Google Drive.");
 
-    if (!driveStream) {
-        return res.status(500).send("Erro ao acessar Google Drive.");
-    }
-
-    // Para segurança, enviamos stream para um PassThrough
     const inputStream = new PassThrough();
     driveStream.pipe(inputStream);
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
 
-    console.log("🎞️ Iniciando ffmpeg HLS (Google Drive API)...");
-
     ffmpeg(inputStream)
         .inputOptions([
             "-analyzeduration", "2147483647",
             "-probesize", "2147483647",
-            "-f", "matroska"   // 👈 FORÇAR FFMPEG A ENTENDER MKV
+            "-f", "matroska",
+            "-fflags", "nobuffer",
+            "-use_wallclock_as_timestamps", "1"
         ])
         .setFfmpegPath(FF)
         .addOptions([
-            "-preset ultrafast",
+            "-preset", "ultrafast",
             "-tune", "zerolatency",
+            "-flags", "low_delay",
+            "-avioflags", "direct",
+            "-max_interleave_delta", "0",
             "-g", "48",
             "-sc_threshold", "0",
             "-vf", "scale=1280:-1",
@@ -114,32 +93,24 @@ app.get("/hls", async (req, res) => {
         .pipe(res);
 });
 
-// ==========================================================
-// ROTA PROXY (arquivo bruto, opcional)
-// ==========================================================
-
+// PROXY
 app.get("/proxy", async (req, res) => {
     const fileId = req.query.fileId;
     if (!fileId) return res.status(400).send("Missing fileId");
 
     const stream = await getDriveStream(fileId);
-
     if (!stream) return res.status(500).send("Erro ao acessar Google Drive.");
 
     res.setHeader("Content-Type", "video/mp4");
     stream.pipe(res);
 });
 
-// ==========================================================
 // START SERVIDOR
-// ==========================================================
-
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
     console.log("🔥 SERVIDOR STRENIX GOOGLE-DRIVE-HLS INICIADO!");
     console.log("🌍 Porta:", PORT);
-    console.log("🛠 Rotas disponíveis:");
     console.log("👉 /proxy?fileId=");
     console.log("👉 /hls?fileId=");
 });
