@@ -93,10 +93,8 @@ app.get("/hls", async (req, res) => {
 
     ffmpeg(videoStream)
         .inputOptions([
-            "-reorder_queue_size", "99999",
             "-analyzeduration", "2147483647",
-            "-probesize", "2147483647",
-            "-fflags", "+discardcorrupt"
+            "-probesize", "2147483647"
         ])
         .setFfmpegPath(FF)
         .addOptions([
@@ -117,7 +115,9 @@ app.get("/hls", async (req, res) => {
         })
         .on("error", (err) => {
             console.error("❌ Erro no ffmpeg:", err);
-            try { res.end(); } catch {}
+            try { 
+                res.end(); 
+            } catch {}
         })
         .pipe(res);
 });
