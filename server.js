@@ -80,7 +80,6 @@ app.get("/hls", async (req, res) => {
             return res.status(500).send("Erro ao acessar Google Drive.");
         }
 
-        // Pipe direto do Drive para FFmpeg
         driveStream.pipe(videoStream);
 
     } catch (err) {
@@ -94,21 +93,21 @@ app.get("/hls", async (req, res) => {
 
     ffmpeg(videoStream)
         .inputOptions([
+            "-reorder_queue_size", "99999",
             "-analyzeduration", "2147483647",
             "-probesize", "2147483647",
-            "-fflags", "+discardcorrupt",
-            "-safe", "0"
+            "-fflags", "+discardcorrupt"
         ])
         .setFfmpegPath(FF)
         .addOptions([
             "-preset ultrafast",
             "-g 48",
             "-sc_threshold 0",
-            "-tune zerolatency",
-            "-vf scale=1280:-1",
-            "-hls_time 4",
-            "-hls_list_size 0",
-            "-hls_flags delete_segments+append_list",
+            "-tune", "zerolatency",
+            "-vf", "scale=1280:-1",
+            "-hls_time", "4",
+            "-hls_list_size", "0",
+            "-hls_flags", "delete_segments+append_list",
             "-max_muxing_queue_size", "99999"
         ])
         .format("hls")
@@ -118,9 +117,7 @@ app.get("/hls", async (req, res) => {
         })
         .on("error", (err) => {
             console.error("❌ Erro no ffmpeg:", err);
-            try {
-                res.end();
-            } catch (e) {}
+            try { res.end(); } catch {}
         })
         .pipe(res);
 });
