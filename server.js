@@ -24,65 +24,87 @@ const auth = new google.auth.GoogleAuth({
 const drive = google.drive({ version: "v3", auth });
 
 // =============================================================
-//  FUNÇÃO PARA LER QUALQUER ARQUIVO DO DRIVE (STREAM)
+//  UTIL: LISTAR ARQUIVOS DENTRO DA PASTA
 // =============================================================
-async function getDriveStream(fileId) {
-    try {
-        const { data } = await drive.files.get(
-            { fileId, alt: "media" },
-            { responseType: "stream" }
-        );
-        return data;
-    } catch (err) {
-        console.error("❌ Erro ao obter stream do Drive:", err.response?.status);
-        return null;
-    }
+async function listarArquivosDaPasta(folderId) {
+    const lista = [];
+
+    let pageToken = null;
+    do {
+        const res = await drive.files.list({
+            q: `'${folderId}' in parents`,
+            fields: "files(id,name,mimeType)",
+            pageToken
+        });
+
+        lista.push(...res.data.files);
+        pageToken = res.data.nextPageToken;
+    } while (pageToken);
+
+    return lista;
 }
 
 // =============================================================
-// 1) PROXY PARA ARQUIVOS TS (SEM TRANSCODIFICAR)
+// 1) PROXY PARA ARQUIVOS TS (SEM TRANSCODIFICAÇÃO)
 // =============================================================
 app.get("/ts", async (req, res) => {
     const fileId = req.query.fileId;
     if (!fileId) return res.status(400).send("Missing fileId");
 
-    const stream = await getDriveStream(fileId);
-    if (!stream) return res.status(500).send("Erro ao acessar Google Drive.");
+    try {
+        const { data } = await drive.files.get(
+            { fileId, alt: "media" },
+            { responseType: "stream" }
+        );
 
-    res.setHeader("Content-Type", "video/mp2t");
-    stream.pipe(res);
+        res.setHeader("Content-Type", "video/mp2t");
+        data.pipe(res);
+
+    } catch (err) {
+        console.error("❌ Erro ao servir TS:", err);
+        res.status(500).send("Erro ao acessar TS.");
+    }
 });
 
 // =============================================================
-// 2) PROXY DO M3U8 REAL DO DRIVE
-//    - LÊ O ARQUIVO ORIGINAL
-//    - REESCREVE OS CAMINHOS .TS PARA /ts?fileId=XXX
+// 2) RENDERIZAR M3U8 REAL DO DRIVE AUTOMATICAMENTE
 // =============================================================
 app.get("/render_drive_m3u8", async (req, res) => {
-    const fileId = req.query.fileId;
-    if (!fileId) return res.status(400).send("Missing fileId");
+    const folderId = req.query.folderId;
+    if (!folderId) return res.status(400).send("Missing folderId");
 
     try {
-        // LER O M3U8 REAL COMO TEXTO
-        const file = await drive.files.get(
-            { fileId, alt: "media" },
+        // LISTA TUDO
+        const arquivos = await listarArquivosDaPasta(folderId);
+
+        // Acha o m3u8 original
+        const m3u8 = arquivos.find(arq => arq.name.endsWith(".m3u8"));
+        if (!m3u8) return res.status(404).send("Nenhum .m3u8 encontrado.");
+
+        // Lê o conteúdo do playlist.m3u8
+        const { data } = await drive.files.get(
+            { fileId: m3u8.id, alt: "media" },
             { responseType: "text" }
         );
 
-        let texto = file.data;
+        let texto = data;
 
-        // AQUI VOCÊ CONFIGURA SUAS PARTES DE DRIVE
-        // Exemplo: segmentos nomeados "segmento_00001.ts"
-        texto = texto.replace(/(segmento_\d+\.ts)/g, (match) => {
-            return `/ts?fileId=${req.query.folder}_${match}`;
+        // Para cada arquivo TS, substitui nome pelo link /ts
+        arquivos.forEach(arq => {
+            if (arq.name.endsWith(".ts")) {
+                texto = texto.replace(
+                    new RegExp(arq.name, "g"),
+                    `/ts?fileId=${arq.id}`
+                );
+            }
         });
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
         res.send(texto);
 
     } catch (err) {
-        console.error("❌ Erro ao abrir m3u8:", err);
-        res.status(500).send("Erro ao abrir m3u8.");
+        console.error("❌ Erro ao montar m3u8:", err);
+        res.status(500).send("Erro ao processar m3u8.");
     }
 });
 
@@ -90,15 +112,15 @@ app.get("/render_drive_m3u8", async (req, res) => {
 // 3) ARQUIVO M3U8 MÍNIMO (2–10 KB) — IGUAL AO STREMIO
 // =============================================================
 app.get("/m3u8_proxy", async (req, res) => {
-    const fileId = req.query.fileId;
-    if (!fileId) return res.status(400).send("Missing fileId");
+    const folderId = req.query.folderId;
+    if (!folderId) return res.status(400).send("Missing folderId");
 
     const urlBase = `${req.protocol}://${req.get("host")}`;
 
     const texto = `#EXTM3U
 #EXT-X-VERSION:3
-#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=1800000,RESOLUTION=1280x720,NAME="HD"
-${urlBase}/render_drive_m3u8?fileId=${fileId}
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720
+${urlBase}/render_drive_m3u8?folderId=${folderId}
 `;
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -110,7 +132,7 @@ ${urlBase}/render_drive_m3u8?fileId=${fileId}
 // =============================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log("🔥 SERVIDOR STRENIX M3U8-PROXY INICIADO!");
+    console.log("🔥 SERVIDOR STRENIX HLS AUTO-ID INICIADO!");
     console.log("🌍 Porta:", PORT);
 });
 
