@@ -1,160 +1,175 @@
 import express from "express";
 import cors from "cors";
-import fetch from "node-fetch";
+import { google } from "googleapis";
 import AdmZip from "adm-zip";
 
 const app = express();
 app.use(cors());
 
 // ==================================================================
-//  CACHE EM RAM (ZIP → { m3u8, tsMap })
+//  GOOGLE DRIVE AUTH
 // ==================================================================
-const zipCache = new Map();
-const CACHE_TIME = 5 * 60 * 1000; // 5 minutos
+let serviceAccountKey = null;
 
-function setCache(fileId, data) {
-    zipCache.set(fileId, { data, time: Date.now() });
+try {
+    serviceAccountKey = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+} catch (err) {
+    console.error("❌ ERRO AO LER GOOGLE_SERVICE_ACCOUNT_KEY:", err);
 }
 
-function getCache(fileId) {
-    const entry = zipCache.get(fileId);
-    if (!entry) return null;
+const auth = new google.auth.GoogleAuth({
+    credentials: serviceAccountKey,
+    scopes: ["https://www.googleapis.com/auth/drive.readonly"],
+});
 
-    if (Date.now() - entry.time > CACHE_TIME) {
-        zipCache.delete(fileId);
-        return null;
-    }
-
-    return entry.data;
-}
+const drive = google.drive({ version: "v3", auth });
 
 // ==================================================================
-//  FUNÇÃO PARA BAIXAR ARQUIVO ZIP DO GOOGLE DRIVE (STREAM)
+//  CACHE EM RAM (ZIP EXTRAÍDO)
 // ==================================================================
-async function baixarZIP(fileId) {
-    const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${process.env.GOOGLE_API_KEY}`;
+const zipCache = new Map(); // fileId → { files: Map, expires: Date }
 
-    const resposta = await fetch(url);
-    if (!resposta.ok) throw new Error("Erro ao baixar ZIP do Google Drive");
-
-    return Buffer.from(await resposta.arrayBuffer());
-}
+// tempo do cache: 5 minutos
+const CACHE_MS = 5 * 60 * 1000;
 
 // ==================================================================
-//  PROCESSAR ZIP NA RAM
+//  FUNÇÃO: CARREGAR ZIP DO DRIVE (COM CACHE)
 // ==================================================================
-function processarZip(bufferZip) {
-    const zip = new AdmZip(bufferZip);
-    const entries = zip.getEntries();
+async function carregarZipDrive(fileId) {
+    const agora = Date.now();
 
-    let m3u8File = null;
-    const tsMap = {};
-
-    // Localiza .m3u8 e .ts
-    for (const e of entries) {
-        if (e.entryName.endsWith(".m3u8") && !m3u8File) {
-            m3u8File = e;
-        }
-
-        if (e.entryName.endsWith(".ts")) {
-            const numero = e.entryName.match(/\d+/)?.[0];
-            if (numero) tsMap[numero] = e;
+    // Se temos no cache e ainda não expirou → retornar
+    if (zipCache.has(fileId)) {
+        const item = zipCache.get(fileId);
+        if (agora < item.expires) {
+            return item.files;
         }
     }
 
-    if (!m3u8File) throw new Error("Nenhum arquivo .m3u8 encontrado no ZIP");
+    console.log("⬇️ Baixando ZIP do Google Drive:", fileId);
 
-    return { m3u8File, tsMap };
+    // Baixa arquivo ZIP do drive
+    const res = await drive.files.get(
+        { fileId, alt: "media" },
+        { responseType: "arraybuffer" }
+    );
+
+    const buffer = Buffer.from(res.data);
+
+    // Extrai o ZIP em RAM
+    const zip = new AdmZip(buffer);
+
+    // Mapeia todos os arquivos extraídos
+    const arquivos = new Map();
+
+    for (const entry of zip.getEntries()) {
+        if (!entry.isDirectory) {
+            arquivos.set(entry.entryName, entry.getData());
+        }
+    }
+
+    console.log("📦 ZIP extraído com", arquivos.size, "arquivos.");
+
+    // Armazena no cache
+    zipCache.set(fileId, {
+        files: arquivos,
+        expires: agora + CACHE_MS
+    });
+
+    return arquivos;
 }
 
 // ==================================================================
-//  ROTAS
+//  UTIL: ACHAR ARQUIVO EM QUALQUER SUBPASTA
 // ==================================================================
+function findFileByEndsWith(files, ending) {
+    for (const [name] of files) {
+        if (name.toLowerCase().endsWith(ending.toLowerCase())) {
+            return name;
+        }
+    }
+    return null;
+}
 
-// -------------------------------------------------------------
-// 1) RENDERIZAR M3U8 DO ZIP (COM REESCRITA DE SEGMENTOS)
-// -------------------------------------------------------------
+// ==================================================================
+// 1) SERVIR SEGMENTO .TS
+// ==================================================================
+app.get("/ts_zip", async (req, res) => {
+    const fileId = req.query.fileId;
+    const name = req.query.name;
+
+    if (!fileId || !name) {
+        return res.status(400).send("Missing fileId or name");
+    }
+
+    try {
+        const files = await carregarZipDrive(fileId);
+
+        if (!files.has(name)) {
+            return res.status(404).send("Arquivo TS não encontrado no ZIP");
+        }
+
+        res.setHeader("Content-Type", "video/mp2t");
+        res.end(files.get(name));
+
+    } catch (err) {
+        console.error("❌ Erro ao servir TS:", err);
+        res.status(500).send("Erro ao servir TS.");
+    }
+});
+
+// ==================================================================
+// 2) RENDERIZAR M3U8 COMPLETO A PARTIR DO ZIP
+// ==================================================================
 app.get("/hls_zip", async (req, res) => {
     const fileId = req.query.fileId;
     if (!fileId) return res.status(400).send("Missing fileId");
 
     try {
-        // usa cache se existir
-        let data = getCache(fileId);
-        if (!data) {
-            const zipBuffer = await baixarZIP(fileId);
-            data = processarZip(zipBuffer);
-            setCache(fileId, data);
+        const files = await carregarZipDrive(fileId);
+
+        // Achar playlist.m3u8 em qualquer pasta
+        const m3u8Name = findFileByEndsWith(files, ".m3u8");
+
+        if (!m3u8Name) {
+            return res.status(404).send("Nenhum playlist.m3u8 encontrado no ZIP");
         }
 
-        const { m3u8File, tsMap } = data;
+        console.log("🎵 M3U8 encontrado:", m3u8Name);
 
-        let texto = m3u8File.getData().toString("utf-8");
-        const linhas = texto.split("\n");
+        const playlist = files.get(m3u8Name).toString("utf8");
+        const linhas = playlist.split("\n");
 
-        // reescrever segmentos
-        for (let i = 0; i < linhas.length; i++) {
-            const l = linhas[i].trim();
-            if (l.endsWith(".ts")) {
-                const numero = l.match(/\d+/)?.[0];
+        const newLines = [];
 
-                if (numero && tsMap[numero]) {
-                    linhas[i] = `/ts_zip?fileId=${fileId}&seg=${numero}`;
+        for (let linha of linhas) {
+            const clean = linha.trim();
+
+            if (clean.endsWith(".ts")) {
+                // extrai o nome do arquivo real usado no ZIP
+                // Ex: "segmento_00012.ts"
+                const nomeTS = clean.split("/").pop();
+
+                // procurar o .ts dentro do ZIP (em subpastas também)
+                const tsReal = findFileByEndsWith(files, nomeTS);
+
+                if (tsReal) {
+                    linha = `/ts_zip?fileId=${fileId}&name=${encodeURIComponent(tsReal)}`;
+                } else {
+                    console.warn("⚠️ TS não encontrado:", nomeTS);
                 }
             }
+
+            newLines.push(linha);
         }
 
-        const finalM3u8 = linhas.join("\n");
-
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        res.send(finalM3u8);
+        res.send(newLines.join("\n"));
 
     } catch (err) {
-        console.error("Erro /hls_zip:", err);
-        res.status(500).send("Erro ao processar ZIP");
+        console.error("❌ Erro no HLS ZIP:", err);
+        res.status(500).send("Falha ao processar ZIP.");
     }
-});
-
-// -------------------------------------------------------------
-// 2) SERVIR .TS DIRETO DO ZIP NA RAM
-// -------------------------------------------------------------
-app.get("/ts_zip", async (req, res) => {
-    const fileId = req.query.fileId;
-    const seg = req.query.seg;
-
-    if (!fileId || !seg) return res.status(400).send("Missing params");
-
-    try {
-        const data = getCache(fileId);
-        if (!data) return res.status(404).send("ZIP não carregado");
-
-        const segFile = data.tsMap[seg];
-        if (!segFile) return res.status(404).send("Segmento não encontrado");
-
-        res.setHeader("Content-Type", "video/mp2t");
-        res.send(segFile.getData());
-
-    } catch (err) {
-        console.error("Erro /ts_zip:", err);
-        res.status(500).send("Erro ao servir segmento TS");
-    }
-});
-
-// -------------------------------------------------------------
-// 3) M3U8 MINIMAL (2 KB)
-// -------------------------------------------------------------
-app.get("/m3u8_zip", (req, res) => {
-    const fileId = req.query.fileId;
-    const urlBase = `${req.protocol}://${req.get("host")}`;
-
-    const texto = `#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720
-${urlBase}/hls_zip?fileId=${fileId}
-`;
-
-    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-    res.send(texto);
 });
 
 // ==================================================================
@@ -162,7 +177,7 @@ ${urlBase}/hls_zip?fileId=${fileId}
 // ==================================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log("🔥 SERVIDOR STRENIX ZIP→RAM INICIADO!");
+    console.log("🔥 SERVIDOR STRENIX HLS ZIP INICIADO!");
     console.log("🌍 Porta:", PORT);
 });
 
