@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import { google } from "googleapis";
+import AdmZip from "adm-zip"; // IMPORTANTE: para abrir o ZIP
 
 const app = express();
 app.use(cors());
@@ -24,135 +25,84 @@ const auth = new google.auth.GoogleAuth({
 const drive = google.drive({ version: "v3", auth });
 
 // ==================================================================
-//  UTIL: LISTAR TODOS OS ARQUIVOS DA PASTA
+// FUNÇÃO: BAIXAR ZIP COMPLETO DO GOOGLE DRIVE
 // ==================================================================
-async function listarArquivosDaPasta(folderId) {
-    const lista = [];
-    let pageToken = null;
+async function baixarZipDoDrive(fileId) {
+    const { data } = await drive.files.get(
+        { fileId, alt: "media" },
+        { responseType: "arraybuffer" }
+    );
 
-    do {
-        const res = await drive.files.list({
-            q: `'${folderId}' in parents`,
-            fields: "files(id,name,mimeType)",
-            pageToken
-        });
-
-        lista.push(...res.data.files);
-        pageToken = res.data.nextPageToken;
-    } while (pageToken);
-
-    return lista;
+    return new AdmZip(Buffer.from(data));
 }
 
 // ==================================================================
-// 1) PROXY PARA ARQUIVOS TS (SEM TRANSCODIFICAR)
+// 1) /hls_zip → CARREGA E REESCREVE O PLAYLIST.M3U8 DENTRO DO ZIP
 // ==================================================================
-app.get("/ts", async (req, res) => {
+app.get("/hls_zip", async (req, res) => {
     const fileId = req.query.fileId;
-    if (!fileId) return res.status(400).send("Missing fileId");
+    if (!fileId) return res.status(400).send("missing fileId");
 
     try {
-        const { data } = await drive.files.get(
-            { fileId, alt: "media" },
-            { responseType: "stream" }
-        );
+        const zip = await baixarZipDoDrive(fileId);
 
-        res.setHeader("Content-Type", "video/mp2t");
-        data.pipe(res);
-
-    } catch (err) {
-        console.error("❌ Erro ao servir TS:", err);
-        res.status(500).send("Erro ao acessar segmento TS.");
-    }
-});
-
-// ==================================================================
-// 2) RENDERIZAR O M3U8 REAL DO DRIVE — COM MAPEAMENTO AUTOMÁTICO
-// ==================================================================
-app.get("/render_drive_m3u8", async (req, res) => {
-    const folderId = req.query.folderId;
-    if (!folderId) return res.status(400).send("Missing folderId");
-
-    try {
-        // Lista todos os arquivos da pasta
-        const arquivos = await listarArquivosDaPasta(folderId);
-
-        // Procura o arquivo .m3u8
-        const m3u8File = arquivos.find(arq => arq.name.endsWith(".m3u8"));
-        if (!m3u8File) {
-            return res.status(404).send("Nenhum arquivo .m3u8 encontrado dentro da pasta.");
+        // LOCALIZA O ARQUIVO 'playlist.m3u8' DENTRO DO ZIP
+        const entry = zip.getEntry("playlist.m3u8");
+        if (!entry) {
+            return res.status(404).send("playlist.m3u8 não encontrado dentro do ZIP");
         }
 
-        // Lê o conteúdo original do m3u8
-        const { data } = await drive.files.get(
-            { fileId: m3u8File.id, alt: "media" },
-            { responseType: "text" }
-        );
+        // LÊ O CONTEÚDO DO PLAYLIST.M3U8
+        let m3u8 = entry.getData().toString("utf8");
 
-        let texto = data;
-
-        // Mapeia cada linha e substitui segmento por arquivo correto
-        const linhas = texto.split("\n");
-
-        const tsMap = {};
-
-        // Monta um mapa numerico → arquivo do Drive
-        for (const arquivo of arquivos) {
-            if (arquivo.name.endsWith(".ts")) {
-                const num = arquivo.name.match(/\d+/)?.[0]; // extrai número
-                if (num) tsMap[num] = arquivo.id;
-            }
-        }
-
-        // Substitui cada segmento
-        for (let i = 0; i < linhas.length; i++) {
-            const linha = linhas[i].trim();
-
-            if (linha.endsWith(".ts")) {
-                const numero = linha.match(/\d+/)?.[0];
-
-                if (numero && tsMap[numero]) {
-                    linhas[i] = `/ts?fileId=${tsMap[numero]}`;
-                }
-            }
-        }
-
-        const textoFinal = linhas.join("\n");
+        // REESCREVE AS LINHAS DO TIPO "segmento_00000.ts"
+        m3u8 = m3u8.replace(/segmento_(\d+)\.ts/g, (original, numero) => {
+            return `/ts_zip?fileId=${fileId}&seg=${numero}`;
+        });
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        res.send(textoFinal);
+        res.send(m3u8);
 
     } catch (err) {
-        console.error("❌ Erro ao processar M3U8:", err);
-        res.status(500).send("Erro ao processar M3U8.");
+        console.error("❌ ERRO NO /hls_zip:", err);
+        res.status(500).send("Erro processando ZIP");
     }
 });
 
 // ==================================================================
-// 3) ARQUIVO M3U8 MINIMAL (2–10 KB) — ESTILO STREAMING / STREMIO
+// 2) /ts_zip → ENTREGA ARQUIVO .TS INTERNAMENTE DO ZIP
 // ==================================================================
-app.get("/m3u8_proxy", async (req, res) => {
-    const folderId = req.query.folderId;
-    if (!folderId) return res.status(400).send("Missing folderId");
+app.get("/ts_zip", async (req, res) => {
+    const fileId = req.query.fileId;
+    const segNum = req.query.seg;
 
-    const urlBase = `${req.protocol}://${req.get("host")}`;
+    if (!fileId || !segNum) return res.status(400).send("missing parameters");
 
-    const texto = `#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720
-${urlBase}/render_drive_m3u8?folderId=${folderId}
-`;
+    try {
+        const zip = await baixarZipDoDrive(fileId);
 
-    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-    res.send(texto);
+        const nomeArquivo = `segmento_${String(segNum).padStart(5, "0")}.ts`;
+
+        const entry = zip.getEntry(nomeArquivo);
+        if (!entry) {
+            return res.status(404).send(`Segmento ${nomeArquivo} não encontrado`);
+        }
+
+        res.setHeader("Content-Type", "video/mp2t");
+        res.send(entry.getData());
+
+    } catch (err) {
+        console.error("❌ ERRO NO /ts_zip:", err);
+        res.status(500).send("Erro carregando segmento");
+    }
 });
 
 // ==================================================================
-//  START SERVER
+//  INICIAR SERVIDOR
 // ==================================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log("🔥 SERVIDOR STRENIX HLS AUTO-ID INICIADO!");
+    console.log("🔥 Servidor HLS ZIP INICIADO!");
     console.log("🌍 Porta:", PORT);
 });
 
