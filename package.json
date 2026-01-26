@@ -1,18 +1,14 @@
 {
-  "name": "strenix-hls",
-  "version": "1.0.0",
-  "description": "Servidor HLS com Google Drive + ZIP",
+  "name": "nix-music-converter",
+  "version": "2.0.0",
+  "description": "Servidor conversor de áudio (YouTube URL -> MP3) usando yt-dlp + ffmpeg. Feito para ser usado pelo MusicaAgent da Nix.",
   "main": "server.js",
   "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "adm-zip": "^0.5.10",
     "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "googleapis": "^118.0.0",
-    "node-fetch": "^3.3.2"
+    "express": "^4.18.2"
   }
 }
-
